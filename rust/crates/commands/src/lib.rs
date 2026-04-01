@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use plugins::{PluginError, PluginManager, PluginSummary};
-use runtime::{compact_session, CompactionConfig, Session};
+use plugins::{PluginError, PluginManager, PluginManagerConfig, PluginSummary};
+use runtime::{compact_session, CompactionConfig, ConfigLoader, Session};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -284,16 +284,16 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agents",
         aliases: &[],
-        summary: "List configured agents",
-        argument_hint: None,
+        summary: "List or invoke configured agents",
+        argument_hint: Some("[list|--help|<agent>]"),
         resume_supported: true,
         category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
         name: "skills",
         aliases: &[],
-        summary: "List available skills",
-        argument_hint: None,
+        summary: "List or invoke available skills",
+        argument_hint: Some("[list|--help|<skill> [args]]"),
         resume_supported: true,
         category: SlashCommandCategory::Automation,
     },
@@ -631,6 +631,7 @@ enum DefinitionSource {
     UserCodexHome,
     UserCodex,
     UserClaw,
+    Plugin,
 }
 
 impl DefinitionSource {
@@ -641,6 +642,7 @@ impl DefinitionSource {
             Self::UserCodexHome => "User ($CODEX_HOME)",
             Self::UserCodex => "User (~/.codex)",
             Self::UserClaw => "User (~/.claw)",
+            Self::Plugin => "Plugins",
         }
     }
 }
@@ -684,6 +686,30 @@ struct SkillRoot {
     source: DefinitionSource,
     path: PathBuf,
     origin: SkillOrigin,
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefinitionRoot {
+    source: DefinitionSource,
+    path: PathBuf,
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillEntry {
+    name: String,
+    path: PathBuf,
+    description: Option<String>,
+    source: DefinitionSource,
+    origin: SkillOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvokeCommandAction {
+    Browse,
+    Help,
+    Invoke(String),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -813,7 +839,7 @@ pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
     match normalize_optional_args(args) {
         None | Some("list") => {
-            let roots = discover_skill_roots(cwd);
+            let roots = discover_skill_roots(cwd)?;
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report(&skills))
         }
@@ -1260,7 +1286,72 @@ fn resolve_plugin_target(
     }
 }
 
-fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
+pub fn classify_agents_slash_command(args: Option<&str>) -> InvokeCommandAction {
+    classify_invoke_command(args, "/prompts:")
+}
+
+pub fn classify_skills_slash_command(args: Option<&str>) -> InvokeCommandAction {
+    classify_invoke_command(args, "$")
+}
+
+pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
+    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
+    if requested.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill must not be empty",
+        ));
+    }
+
+    let roots = discover_skill_roots(cwd)?;
+    let entries = load_skill_entries_from_roots(&roots)?;
+
+    if let Some((namespace, name)) = requested.split_once(':') {
+        return entries
+            .into_iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(&format!("{namespace}:{name}")))
+            .map(|entry| entry.path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown skill: {requested}")));
+    }
+
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(requested))
+    {
+        return Ok(entry.path.clone());
+    }
+
+    let plugin_matches = entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .name
+                .split_once(':')
+                .is_some_and(|(_, name)| name.eq_ignore_ascii_case(requested))
+        })
+        .collect::<Vec<_>>();
+
+    match plugin_matches.len() {
+        0 => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("unknown skill: {requested}"),
+        )),
+        1 => Ok(plugin_matches[0].path.clone()),
+        _ => Err(io::Error::other(format!(
+            "skill `{requested}` is provided by multiple plugins; use <plugin>:<skill>"
+        ))),
+    }
+}
+
+fn classify_invoke_command(args: Option<&str>, prefix: &str) -> InvokeCommandAction {
+    match normalize_optional_args(args) {
+        None | Some("list") => InvokeCommandAction::Browse,
+        Some("-h" | "--help" | "help") => InvokeCommandAction::Help,
+        Some(args) => InvokeCommandAction::Invoke(format!("{prefix}{args}")),
+    }
+}
+
+fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<DefinitionRoot> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
@@ -1268,11 +1359,13 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join(leaf),
+            None,
         );
         push_unique_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
             ancestor.join(".claw").join(leaf),
+            None,
         );
     }
 
@@ -1281,6 +1374,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             &mut roots,
             DefinitionSource::UserCodexHome,
             PathBuf::from(codex_home).join(leaf),
+            None,
         );
     }
 
@@ -1290,18 +1384,22 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             &mut roots,
             DefinitionSource::UserCodex,
             home.join(".codex").join(leaf),
+            None,
         );
         push_unique_root(
             &mut roots,
             DefinitionSource::UserClaw,
             home.join(".claw").join(leaf),
+            None,
         );
     }
+
+    append_plugin_definition_roots(&mut roots, cwd, leaf);
 
     roots
 }
 
-fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
+fn discover_skill_roots(cwd: &Path) -> io::Result<Vec<SkillRoot>> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
@@ -1310,24 +1408,28 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join("skills"),
             SkillOrigin::SkillsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
             ancestor.join(".claw").join("skills"),
             SkillOrigin::SkillsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join("commands"),
             SkillOrigin::LegacyCommandsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
             ancestor.join(".claw").join("commands"),
             SkillOrigin::LegacyCommandsDir,
+            None,
         );
     }
 
@@ -1338,12 +1440,14 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             DefinitionSource::UserCodexHome,
             codex_home.join("skills"),
             SkillOrigin::SkillsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserCodexHome,
             codex_home.join("commands"),
             SkillOrigin::LegacyCommandsDir,
+            None,
         );
     }
 
@@ -1354,37 +1458,52 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             DefinitionSource::UserCodex,
             home.join(".codex").join("skills"),
             SkillOrigin::SkillsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserCodex,
             home.join(".codex").join("commands"),
             SkillOrigin::LegacyCommandsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
             home.join(".claw").join("skills"),
             SkillOrigin::SkillsDir,
+            None,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
             home.join(".claw").join("commands"),
             SkillOrigin::LegacyCommandsDir,
+            None,
         );
     }
 
-    roots
+    append_plugin_skill_roots(&mut roots, cwd)?;
+
+    Ok(roots)
 }
 
 fn push_unique_root(
-    roots: &mut Vec<(DefinitionSource, PathBuf)>,
+    roots: &mut Vec<DefinitionRoot>,
     source: DefinitionSource,
     path: PathBuf,
+    namespace: Option<String>,
 ) {
-    if path.is_dir() && !roots.iter().any(|(_, existing)| existing == &path) {
-        roots.push((source, path));
+    if path.is_dir()
+        && !roots
+            .iter()
+            .any(|existing| existing.path == path && existing.namespace == namespace)
+    {
+        roots.push(DefinitionRoot {
+            source,
+            path,
+            namespace,
+        });
     }
 }
 
@@ -1393,25 +1512,29 @@ fn push_unique_skill_root(
     source: DefinitionSource,
     path: PathBuf,
     origin: SkillOrigin,
+    namespace: Option<String>,
 ) {
-    if path.is_dir() && !roots.iter().any(|existing| existing.path == path) {
+    if path.is_dir()
+        && !roots
+            .iter()
+            .any(|existing| existing.path == path && existing.namespace == namespace)
+    {
         roots.push(SkillRoot {
             source,
             path,
             origin,
+            namespace,
         });
     }
 }
 
-fn load_agents_from_roots(
-    roots: &[(DefinitionSource, PathBuf)],
-) -> std::io::Result<Vec<AgentSummary>> {
+fn load_agents_from_roots(roots: &[DefinitionRoot]) -> std::io::Result<Vec<AgentSummary>> {
     let mut agents = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
 
-    for (source, root) in roots {
+    for root in roots {
         let mut root_agents = Vec::new();
-        for entry in fs::read_dir(root)? {
+        for entry in fs::read_dir(&root.path)? {
             let entry = entry?;
             if entry.path().extension().is_none_or(|ext| ext != "toml") {
                 continue;
@@ -1421,12 +1544,13 @@ fn load_agents_from_roots(
                 || entry.file_name().to_string_lossy().to_string(),
                 |stem| stem.to_string_lossy().to_string(),
             );
+            let name = parse_toml_string(&contents, "name").unwrap_or(fallback_name);
             root_agents.push(AgentSummary {
-                name: parse_toml_string(&contents, "name").unwrap_or(fallback_name),
+                name: namespaced_definition_name(root.namespace.as_deref(), &name),
                 description: parse_toml_string(&contents, "description"),
                 model: parse_toml_string(&contents, "model"),
                 reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
-                source: *source,
+                source: root.source,
                 shadowed_by: None,
             });
         }
@@ -1447,8 +1571,32 @@ fn load_agents_from_roots(
 }
 
 fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
+    let entries = load_skill_entries_from_roots(roots)?;
     let mut skills = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
+
+    for entry in entries {
+        let mut skill = SkillSummary {
+            name: entry.name,
+            description: entry.description,
+            source: entry.source,
+            shadowed_by: None,
+            origin: entry.origin,
+        };
+        let key = skill.name.to_ascii_lowercase();
+        if let Some(existing) = active_sources.get(&key) {
+            skill.shadowed_by = Some(*existing);
+        } else {
+            active_sources.insert(key, skill.source);
+        }
+        skills.push(skill);
+    }
+
+    Ok(skills)
+}
+
+fn load_skill_entries_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillEntry>> {
+    let mut skills = Vec::new();
 
     for root in roots {
         let mut root_skills = Vec::new();
@@ -1463,14 +1611,17 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                     if !skill_path.is_file() {
                         continue;
                     }
-                    let contents = fs::read_to_string(skill_path)?;
+                    let contents = fs::read_to_string(&skill_path)?;
                     let (name, description) = parse_skill_frontmatter(&contents);
-                    root_skills.push(SkillSummary {
-                        name: name
-                            .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
+                    let fallback_name = entry.file_name().to_string_lossy().to_string();
+                    root_skills.push(SkillEntry {
+                        name: namespaced_definition_name(
+                            root.namespace.as_deref(),
+                            &name.unwrap_or(fallback_name),
+                        ),
+                        path: skill_path,
                         description,
                         source: root.source,
-                        shadowed_by: None,
                         origin: root.origin,
                     });
                 }
@@ -1497,30 +1648,151 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                         |stem| stem.to_string_lossy().to_string(),
                     );
                     let (name, description) = parse_skill_frontmatter(&contents);
-                    root_skills.push(SkillSummary {
-                        name: name.unwrap_or(fallback_name),
+                    root_skills.push(SkillEntry {
+                        name: namespaced_definition_name(
+                            root.namespace.as_deref(),
+                            &name.unwrap_or(fallback_name),
+                        ),
+                        path: markdown_path,
                         description,
                         source: root.source,
-                        shadowed_by: None,
                         origin: root.origin,
                     });
                 }
             }
         }
         root_skills.sort_by(|left, right| left.name.cmp(&right.name));
-
-        for mut skill in root_skills {
-            let key = skill.name.to_ascii_lowercase();
-            if let Some(existing) = active_sources.get(&key) {
-                skill.shadowed_by = Some(*existing);
-            } else {
-                active_sources.insert(key, skill.source);
-            }
-            skills.push(skill);
-        }
+        skills.extend(root_skills);
     }
 
     Ok(skills)
+}
+
+fn namespaced_definition_name(namespace: Option<&str>, name: &str) -> String {
+    namespace.map_or_else(|| name.to_string(), |namespace| format!("{namespace}:{name}"))
+}
+
+fn append_plugin_definition_roots(roots: &mut Vec<DefinitionRoot>, cwd: &Path, leaf: &str) {
+    if let Ok(plugins) = discover_enabled_plugins(cwd) {
+        for plugin in plugins {
+            let Some(root) = plugin.metadata.root.as_ref() else {
+                continue;
+            };
+            let namespace = Some(plugin_namespace(&plugin));
+            push_unique_root(
+                roots,
+                DefinitionSource::Plugin,
+                root.join(".codex").join(leaf),
+                namespace.clone(),
+            );
+            push_unique_root(
+                roots,
+                DefinitionSource::Plugin,
+                root.join(".claw").join(leaf),
+                namespace.clone(),
+            );
+            push_unique_root(
+                roots,
+                DefinitionSource::Plugin,
+                root.join(leaf),
+                namespace,
+            );
+        }
+    }
+}
+
+fn append_plugin_skill_roots(roots: &mut Vec<SkillRoot>, cwd: &Path) -> io::Result<()> {
+    for plugin in discover_enabled_plugins(cwd)? {
+        let Some(root) = plugin.metadata.root.as_ref() else {
+            continue;
+        };
+        let namespace = Some(plugin_namespace(&plugin));
+        push_unique_skill_root(
+            roots,
+            DefinitionSource::Plugin,
+            root.join(".codex").join("skills"),
+            SkillOrigin::SkillsDir,
+            namespace.clone(),
+        );
+        push_unique_skill_root(
+            roots,
+            DefinitionSource::Plugin,
+            root.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+            namespace.clone(),
+        );
+        push_unique_skill_root(
+            roots,
+            DefinitionSource::Plugin,
+            root.join("skills"),
+            SkillOrigin::SkillsDir,
+            namespace.clone(),
+        );
+        push_unique_skill_root(
+            roots,
+            DefinitionSource::Plugin,
+            root.join(".codex").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+            namespace.clone(),
+        );
+        push_unique_skill_root(
+            roots,
+            DefinitionSource::Plugin,
+            root.join(".claw").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+            namespace.clone(),
+        );
+        push_unique_skill_root(
+            roots,
+            DefinitionSource::Plugin,
+            root.join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+            namespace,
+        );
+    }
+
+    Ok(())
+}
+
+fn discover_enabled_plugins(cwd: &Path) -> io::Result<Vec<PluginSummary>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load().map_err(io::Error::other)?;
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+        .list_installed_plugins()
+        .map(|plugins| plugins.into_iter().filter(|plugin| plugin.enabled).collect())
+        .map_err(io::Error::other)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
+}
+
+fn plugin_namespace(plugin: &PluginSummary) -> String {
+    plugin.metadata.name.clone()
 }
 
 fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
@@ -1613,6 +1885,7 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
         DefinitionSource::UserCodexHome,
         DefinitionSource::UserCodex,
         DefinitionSource::UserClaw,
+        DefinitionSource::Plugin,
     ] {
         let group = agents
             .iter()
@@ -1671,6 +1944,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionSource::UserCodexHome,
         DefinitionSource::UserCodex,
         DefinitionSource::UserClaw,
+        DefinitionSource::Plugin,
     ] {
         let group = skills
             .iter()
@@ -1708,9 +1982,11 @@ fn normalize_optional_args(args: Option<&str>) -> Option<&str> {
 fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
-        "  Usage            /agents".to_string(),
-        "  Direct CLI       claw agents".to_string(),
-        "  Sources          .codex/agents, .claw/agents, $CODEX_HOME/agents".to_string(),
+        "  Usage            /agents [list|--help|<agent>]".to_string(),
+        "  Direct CLI       claw agents [list|--help|<agent>]".to_string(),
+        "  Invoke           /agents planner -> /prompts:planner".to_string(),
+        "  Sources          .codex/agents, .claw/agents, $CODEX_HOME/agents, enabled plugins"
+            .to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -1721,9 +1997,12 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills".to_string(),
-        "  Direct CLI       claw skills".to_string(),
-        "  Sources          .codex/skills, .claw/skills, legacy /commands".to_string(),
+        "  Usage            /skills [list|--help|<skill> [args]]".to_string(),
+        "  Direct CLI       claw skills [list|--help|<skill> [args]]".to_string(),
+        "  Invoke           /skills help overview -> $help overview".to_string(),
+        "  Namespacing      /skills plugin-name:skill".to_string(),
+        "  Sources          .codex/skills, .claw/skills, legacy /commands, enabled plugins"
+            .to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -1790,13 +2069,15 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
+        classify_agents_slash_command, classify_skills_slash_command,
         handle_branch_slash_command, handle_commit_push_pr_slash_command,
-        handle_commit_slash_command, handle_plugins_slash_command, handle_slash_command,
-        handle_worktree_slash_command, load_agents_from_roots, load_skills_from_roots,
-        render_agents_report, render_plugins_report, render_skills_report,
-        render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, CommitPushPrRequest, DefinitionSource, SkillOrigin, SkillRoot,
-        SlashCommand,
+        handle_commit_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
+        handle_slash_command, handle_worktree_slash_command, load_agents_from_roots,
+        load_skills_from_roots, render_agents_report, render_plugins_report,
+        render_skills_report, render_slash_command_help, resolve_skill_path,
+        resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+        CommitPushPrRequest, DefinitionRoot, DefinitionSource, InvokeCommandAction,
+        SkillOrigin, SkillRoot, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{CompactionConfig, ContentBlock, ConversationMessage, MessageRole, Session};
@@ -2336,8 +2617,16 @@ mod tests {
         );
 
         let roots = vec![
-            (DefinitionSource::ProjectCodex, project_agents),
-            (DefinitionSource::UserCodex, user_agents),
+            DefinitionRoot {
+                source: DefinitionSource::ProjectCodex,
+                path: project_agents,
+                namespace: None,
+            },
+            DefinitionRoot {
+                source: DefinitionSource::UserCodex,
+                path: user_agents,
+                namespace: None,
+            },
         ];
         let report =
             render_agents_report(&load_agents_from_roots(&roots).expect("agent roots should load"));
@@ -2372,16 +2661,19 @@ mod tests {
                 source: DefinitionSource::ProjectCodex,
                 path: project_skills,
                 origin: SkillOrigin::SkillsDir,
+                namespace: None,
             },
             SkillRoot {
                 source: DefinitionSource::ProjectClaw,
                 path: project_commands,
                 origin: SkillOrigin::LegacyCommandsDir,
+                namespace: None,
             },
             SkillRoot {
                 source: DefinitionSource::UserCodex,
                 path: user_skills,
                 origin: SkillOrigin::SkillsDir,
+                namespace: None,
             },
         ];
         let report =
@@ -2424,6 +2716,97 @@ mod tests {
         assert!(skills_unexpected.contains("Unexpected       show help"));
 
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn classifies_agents_and_skills_invocation_args() {
+        assert_eq!(
+            classify_agents_slash_command(None),
+            InvokeCommandAction::Browse
+        );
+        assert_eq!(
+            classify_agents_slash_command(Some("--help")),
+            InvokeCommandAction::Help
+        );
+        assert_eq!(
+            classify_agents_slash_command(Some("planner")),
+            InvokeCommandAction::Invoke("/prompts:planner".to_string())
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("help overview")),
+            InvokeCommandAction::Invoke("$help overview".to_string())
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("oh-my-claudecode:ralplan")),
+            InvokeCommandAction::Invoke("$oh-my-claudecode:ralplan".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_project_and_plugin_scoped_skills() {
+        let _guard = env_lock();
+        let workspace = temp_dir("skill-resolve-workspace");
+        let home = temp_dir("skill-resolve-home");
+        let plugin_root = home
+            .join(".claw")
+            .join("plugins")
+            .join("installed")
+            .join("oh-my-claudecode-external");
+
+        write_skill(
+            &workspace.join(".codex").join("skills"),
+            "ralplan",
+            "Project ralplan",
+        );
+        fs::create_dir_all(plugin_root.join(".claw-plugin")).expect("plugin manifest dir");
+        fs::write(
+            plugin_root.join(".claw-plugin").join("plugin.json"),
+            r#"{
+  "name": "oh-my-claudecode",
+  "version": "1.0.0",
+  "description": "Plugin-scoped skills"
+}"#,
+        )
+        .expect("plugin manifest");
+        write_skill(&plugin_root.join("skills"), "ralplan", "Plugin ralplan");
+        fs::create_dir_all(home.join(".claw")).expect("config home");
+        fs::write(
+            home.join(".claw").join("settings.json"),
+            r#"{
+  "enabledPlugins": {
+    "oh-my-claudecode@external": true
+  }
+}"#,
+        )
+        .expect("settings");
+
+        let old_home = env::var_os("HOME");
+        let old_codex_home = env::var_os("CODEX_HOME");
+        env::set_var("HOME", &home);
+        env::remove_var("CODEX_HOME");
+
+        let local = resolve_skill_path(&workspace, "ralplan").expect("local skill should resolve");
+        assert!(local.ends_with(".codex/skills/ralplan/SKILL.md"));
+
+        let plugin = resolve_skill_path(&workspace, "oh-my-claudecode:ralplan")
+            .expect("plugin skill should resolve");
+        assert!(plugin.ends_with("skills/ralplan/SKILL.md"));
+
+        let skills_report = handle_skills_slash_command(None, &workspace).expect("skills report");
+        assert!(skills_report.contains("Plugins:"));
+        assert!(skills_report.contains("oh-my-claudecode:ralplan · Plugin ralplan"));
+
+        match old_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+        match old_codex_home {
+            Some(value) => env::set_var("CODEX_HOME", value),
+            None => env::remove_var("CODEX_HOME"),
+        }
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

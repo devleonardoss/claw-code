@@ -22,9 +22,10 @@ use api::{
 };
 
 use commands::{
-    handle_agents_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-    suggest_slash_commands, SlashCommand,
+    classify_agents_slash_command, classify_skills_slash_command, handle_agents_slash_command,
+    handle_plugins_slash_command, handle_skills_slash_command, render_slash_command_help,
+    resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+    InvokeCommandAction, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -286,12 +287,30 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     match rest[0].as_str() {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
-        "agents" => Ok(CliAction::Agents {
-            args: join_optional_args(&rest[1..]),
-        }),
-        "skills" => Ok(CliAction::Skills {
-            args: join_optional_args(&rest[1..]),
-        }),
+        "agents" => match classify_agents_slash_command(join_optional_args(&rest[1..]).as_deref()) {
+            InvokeCommandAction::Invoke(prompt) => Ok(CliAction::Prompt {
+                prompt,
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+            }),
+            _ => Ok(CliAction::Agents {
+                args: join_optional_args(&rest[1..]),
+            }),
+        },
+        "skills" => match classify_skills_slash_command(join_optional_args(&rest[1..]).as_deref()) {
+            InvokeCommandAction::Invoke(prompt) => Ok(CliAction::Prompt {
+                prompt,
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+            }),
+            _ => Ok(CliAction::Skills {
+                args: join_optional_args(&rest[1..]),
+            }),
+        },
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
@@ -309,7 +328,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
             })
         }
-        other if other.starts_with('/') => parse_direct_slash_cli_action(&rest),
+        other if other.starts_with('/') => parse_direct_slash_cli_action(
+            &rest,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
             model,
@@ -326,12 +351,40 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
+fn parse_direct_slash_cli_action(
+    rest: &[String],
+    model: String,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Some(SlashCommand::Help) => Ok(CliAction::Help),
-        Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
-        Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
+        Some(SlashCommand::Agents { args }) => {
+            match classify_agents_slash_command(args.as_deref()) {
+                InvokeCommandAction::Invoke(prompt) => Ok(CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }),
+                _ => Ok(CliAction::Agents { args }),
+            }
+        }
+        Some(SlashCommand::Skills { args }) => {
+            match classify_skills_slash_command(args.as_deref()) {
+                InvokeCommandAction::Invoke(prompt) => Ok(CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }),
+                _ => Ok(CliAction::Skills { args }),
+            }
+        }
         Some(command) => Err(format_direct_slash_command_error(
             match &command {
                 SlashCommand::Unknown(name) => format!("/{name}"),
@@ -1321,11 +1374,17 @@ impl LiveCli {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
             SlashCommand::Agents { args } => {
-                Self::print_agents(args.as_deref())?;
+                match classify_agents_slash_command(args.as_deref()) {
+                    InvokeCommandAction::Invoke(prompt) => self.run_turn(&prompt)?,
+                    _ => Self::print_agents(args.as_deref())?,
+                }
                 false
             }
             SlashCommand::Skills { args } => {
-                Self::print_skills(args.as_deref())?;
+                match classify_skills_slash_command(args.as_deref()) {
+                    InvokeCommandAction::Invoke(prompt) => self.run_turn(&prompt)?,
+                    _ => Self::print_skills(args.as_deref())?,
+                }
                 false
             }
             SlashCommand::Branch { .. } => {
@@ -4332,6 +4391,17 @@ mod tests {
                 args: Some("--help".to_string())
             }
         );
+        assert_eq!(
+            parse_args(&["skills".to_string(), "ralplan".to_string()])
+                .expect("skills invoke should parse"),
+            CliAction::Prompt {
+                prompt: "$ralplan".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
     }
 
     #[test]
@@ -4345,10 +4415,36 @@ mod tests {
             CliAction::Skills { args: None }
         );
         assert_eq!(
-            parse_args(&["/skills".to_string(), "help".to_string()])
-                .expect("/skills help should parse"),
-            CliAction::Skills {
-                args: Some("help".to_string())
+            parse_args(&["/skills".to_string(), "help".to_string(), "overview".to_string()])
+                .expect("/skills help overview should invoke"),
+            CliAction::Prompt {
+                prompt: "$help overview".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/skills".to_string(), "oh-my-claudecode:ralplan".to_string()])
+                .expect("/skills namespaced invoke should parse"),
+            CliAction::Prompt {
+                prompt: "$oh-my-claudecode:ralplan".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/agents".to_string(), "planner".to_string()])
+                .expect("/agents planner should invoke"),
+            CliAction::Prompt {
+                prompt: "/prompts:planner".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
         let error = parse_args(&["/status".to_string()])

@@ -8,6 +8,7 @@ use api::{
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
+use commands::resolve_skill_path as resolve_workspace_skill_path;
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
@@ -1455,47 +1456,8 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
-    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
-    if requested.is_empty() {
-        return Err(String::from("skill must not be empty"));
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
-    }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
-    for root in candidates {
-        let direct = root.join(requested).join("SKILL.md");
-        if direct.exists() {
-            return Ok(direct);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
-                {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    Err(format!("unknown skill: {requested}"))
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    resolve_workspace_skill_path(&cwd, skill).map_err(|error| error.to_string())
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -3486,6 +3448,92 @@ mod tests {
             .as_str()
             .expect("path")
             .ends_with("/help/SKILL.md"));
+    }
+
+    #[test]
+    fn skill_resolves_project_and_plugin_scoped_prompts() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("skill-workspace");
+        let home = temp_path("skill-home");
+        let plugin_root = home
+            .join(".claw")
+            .join("plugins")
+            .join("installed")
+            .join("oh-my-claudecode-external");
+        let project_skill_root = workspace.join(".codex").join("skills").join("ralplan");
+        std::fs::create_dir_all(&project_skill_root).expect("project skill dir");
+        std::fs::write(
+            project_skill_root.join("SKILL.md"),
+            "---\nname: ralplan\ndescription: Project skill\n---\n",
+        )
+        .expect("project skill");
+        std::fs::create_dir_all(plugin_root.join(".claw-plugin")).expect("plugin manifest dir");
+        std::fs::write(
+            plugin_root.join(".claw-plugin").join("plugin.json"),
+            r#"{
+  "name": "oh-my-claudecode",
+  "version": "1.0.0",
+  "description": "Plugin skills"
+}"#,
+        )
+        .expect("plugin manifest");
+        std::fs::create_dir_all(home.join(".claw")).expect("config home");
+        std::fs::write(
+            home.join(".claw").join("settings.json"),
+            r#"{
+  "enabledPlugins": {
+    "oh-my-claudecode@external": true
+  }
+}"#,
+        )
+        .expect("settings");
+        let plugin_skill_root = plugin_root.join("skills").join("ralplan");
+        std::fs::create_dir_all(&plugin_skill_root).expect("plugin skill dir");
+        std::fs::write(
+            plugin_skill_root.join("SKILL.md"),
+            "---\nname: ralplan\ndescription: Plugin skill\n---\n",
+        )
+        .expect("plugin skill");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        let old_home = std::env::var_os("HOME");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::set_current_dir(&workspace).expect("set cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CODEX_HOME");
+
+        let project_result = execute_tool("Skill", &json!({ "skill": "ralplan" }))
+            .expect("project skill should resolve");
+        let project_output: serde_json::Value =
+            serde_json::from_str(&project_result).expect("valid json");
+        assert!(project_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".codex/skills/ralplan/SKILL.md"));
+
+        let plugin_result =
+            execute_tool("Skill", &json!({ "skill": "$oh-my-claudecode:ralplan" }))
+                .expect("plugin skill should resolve");
+        let plugin_output: serde_json::Value =
+            serde_json::from_str(&plugin_result).expect("valid json");
+        assert!(plugin_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/ralplan/SKILL.md"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
